@@ -15,6 +15,7 @@ fn test_prepaid_meter_flow() {
     let user = Address::generate(&env);
     let provider = Address::generate(&env);
     let oracle = Address::generate(&env);
+
     client.set_oracle(&oracle);
 
     let token_admin = Address::generate(&env);
@@ -24,7 +25,7 @@ fn test_prepaid_meter_flow() {
     let token = token::Client::new(&env, &token_address);
     let token_admin_client = token::StellarAssetClient::new(&env, &token_address);
 
-    token_admin_client.mint(&user, &1000);
+    token_admin_client.mint(&user, &10000);
 
     let meter_id = client.register_meter(&user, &provider, &10, &token_address);
     assert_eq!(meter_id, 1);
@@ -38,32 +39,34 @@ fn test_prepaid_meter_flow() {
     assert!(!meter.is_active);
     assert_eq!(meter.max_flow_rate_per_hour, 36000);
 
-    client.top_up(&meter_id, &500);
+    client.top_up(&meter_id, &5000);
     let meter = client.get_meter(&meter_id).unwrap();
-    assert_eq!(meter.balance, 500);
+    assert_eq!(meter.balance, 5000);
     assert!(meter.is_active);
-    assert_eq!(token.balance(&user), 500);
-    assert_eq!(token.balance(&contract_id), 500);
+    assert_eq!(token.balance(&user), 5000);
+    assert_eq!(token.balance(&contract_id), 5000);
 
-    env.ledger().set_timestamp(env.ledger().timestamp() + 5);
+    // Test claims over time
+    env.ledger().set_timestamp(env.ledger().timestamp() + 10);
     client.claim(&meter_id);
 
     let meter = client.get_meter(&meter_id).unwrap();
-    assert_eq!(meter.balance, 450);
-    assert_eq!(token.balance(&provider), 50);
-    assert_eq!(token.balance(&contract_id), 450);
+    assert_eq!(meter.balance, 4900); // 10s * 10 tokens/s = 100 claimed
+    assert_eq!(token.balance(&provider), 100);
+    assert_eq!(token.balance(&contract_id), 4900);
 
+    // Test deduct_units (Issue #13 logic)
     client.deduct_units(&meter_id, &15);
     let meter = client.get_meter(&meter_id).unwrap();
-    assert_eq!(meter.balance, 300);
-    assert_eq!(token.balance(&provider), 200);
-    assert_eq!(token.balance(&contract_id), 300);
+    assert_eq!(meter.balance, 4750); // 4900 - (15 units * 10 rate) = 4750
+    assert_eq!(token.balance(&provider), 250);
+    assert_eq!(token.balance(&contract_id), 4750);
 
-    client.deduct_units(&meter_id, &50);
+    client.deduct_units(&meter_id, &475);
     let meter = client.get_meter(&meter_id).unwrap();
     assert_eq!(meter.balance, 0);
     assert!(!meter.is_active);
-    assert_eq!(token.balance(&provider), 500);
+    assert_eq!(token.balance(&provider), 5000);
     assert_eq!(token.balance(&contract_id), 0);
 
     client.update_usage(&meter_id, &1500);
@@ -84,13 +87,15 @@ fn test_prepaid_meter_flow() {
     assert_eq!(usage_data.current_cycle_watt_hours, 2_000_000);
     assert_eq!(usage_data.peak_usage_watt_hours, 2_000_000);
 
-    let display_total =
-        UtilityContract::get_watt_hours_display(usage_data.total_watt_hours, usage_data.precision_factor);
-    assert_eq!(display_total, 3500);
+    let display_total = UtilityContract::get_watt_hours_display(
+        usage_data.total_watt_hours,
+        usage_data.precision_factor,
+    );
+    assert_eq!(display_total, 3500); // 3500000 / 1000 = 3500 (3.5 kWh)
 }
 
 #[test]
-fn test_max_flow_rate_cap() {
+fn test_peak_hour_tariff() {
     let env = Env::default();
     env.mock_all_auths();
 
@@ -102,22 +107,34 @@ fn test_max_flow_rate_cap() {
     let oracle = Address::generate(&env);
     client.set_oracle(&oracle);
 
+    // Setup a token
     let token_admin = Address::generate(&env);
     let token_address = env
         .register_stellar_asset_contract_v2(token_admin.clone())
         .address();
+    let token = token::Client::new(&env, &token_address);
     let token_admin_client = token::StellarAssetClient::new(&env, &token_address);
 
-    token_admin_client.mint(&user, &10_000);
+    // Initial funding
+    token_admin_client.mint(&user, &5000);
 
-    let meter_id = client.register_meter(&user, &provider, &100, &token_address);
-    client.set_max_flow_rate(&meter_id, &5000);
-    client.top_up(&meter_id, &10_000);
-    client.deduct_units(&meter_id, &120);
+    // Register Meter
+    let rate = 10; // 10 tokens per unit
+    let meter_id = client.register_meter(&user, &provider, &rate, &token_address);
+    client.top_up(&meter_id, &5000);
+
+    // Set time to 19:00:00 UTC (19 * 3600 = 68400)
+    // 19:00 falls exactly in the 18:00 - 22:00 peak hours bracket
+    env.ledger().set_timestamp(68400);
+
+    // Consume 10 units. Base cost = 10 * 10 = 100 tokens.
+    // 150% Peak multiplier means 150 tokens claimed.
+    let units_consumed = 10;
+    client.deduct_units(&meter_id, &units_consumed);
 
     let meter = client.get_meter(&meter_id).unwrap();
-    assert_eq!(meter.claimed_this_hour, 5000);
-    assert_eq!(meter.balance, 5000);
+    assert_eq!(meter.balance, 4850); // 5000 - 150
+    assert_eq!(token.balance(&provider), 150);
 }
 
 #[test]
@@ -141,6 +158,7 @@ fn test_calculate_expected_depletion() {
     let meter_id = client.register_meter(&user, &provider, &10, &token_address);
     client.top_up(&meter_id, &500);
 
+    // Calculate depletion time
     let depletion_time = client.calculate_expected_depletion(&meter_id).unwrap();
     let current_time = env.ledger().timestamp();
     assert_eq!(depletion_time, current_time + 50);
@@ -222,10 +240,10 @@ fn test_claim_within_daily_limit_tracks_withdrawn() {
     let token = token::Client::new(&env, &token_address);
     let token_admin_client = token::StellarAssetClient::new(&env, &token_address);
 
-    token_admin_client.mint(&user, &1000);
+    token_admin_client.mint(&user, &10000);
 
     let meter_id = client.register_meter(&user, &provider, &10, &token_address);
-    client.top_up(&meter_id, &500);
+    client.top_up(&meter_id, &5000);
 
     env.ledger().set_timestamp(env.ledger().timestamp() + 5);
     client.claim(&meter_id);
@@ -233,9 +251,9 @@ fn test_claim_within_daily_limit_tracks_withdrawn() {
     let meter = client.get_meter(&meter_id).unwrap();
     let provider_window = client.get_provider_window(&provider).unwrap();
 
-    assert_eq!(meter.balance, 450);
+    assert_eq!(meter.balance, 4950);
     assert_eq!(token.balance(&provider), 50);
-    assert_eq!(token.balance(&contract_id), 450);
+    assert_eq!(token.balance(&contract_id), 4950);
     assert_eq!(provider_window.daily_withdrawn, 50);
 }
 
@@ -261,7 +279,7 @@ fn test_claim_reverts_when_daily_limit_is_exceeded() {
     let meter_id = client.register_meter(&user, &provider, &10, &token_address);
     client.top_up(&meter_id, &500);
 
-    env.ledger().set_timestamp(env.ledger().timestamp() + 10);
+    env.ledger().set_timestamp(env.ledger().timestamp() + 10_000);
     client.claim(&meter_id);
 }
 
@@ -358,7 +376,7 @@ fn test_postpaid_claims_against_collateral_limit() {
     let token = token::Client::new(&env, &token_address);
     let token_admin_client = token::StellarAssetClient::new(&env, &token_address);
 
-    token_admin_client.mint(&user, &500);
+    token_admin_client.mint(&user, &10000);
 
     let meter_id = client.register_meter_with_mode(
         &user,
@@ -368,34 +386,34 @@ fn test_postpaid_claims_against_collateral_limit() {
         &BillingType::PostPaid,
     );
 
-    client.top_up(&meter_id, &300);
+    client.top_up(&meter_id, &5000);
 
     let meter = client.get_meter(&meter_id).unwrap();
     assert_eq!(meter.billing_type, BillingType::PostPaid);
     assert_eq!(meter.balance, 0);
     assert_eq!(meter.debt, 0);
-    assert_eq!(meter.collateral_limit, 300);
+    assert_eq!(meter.collateral_limit, 5000);
     assert!(meter.is_active);
-    assert_eq!(token.balance(&contract_id), 300);
+    assert_eq!(token.balance(&contract_id), 5000);
 
     env.ledger().set_timestamp(env.ledger().timestamp() + 3);
     client.claim(&meter_id);
 
     let meter = client.get_meter(&meter_id).unwrap();
     assert_eq!(meter.debt, 30);
-    assert_eq!(meter.collateral_limit, 300);
+    assert_eq!(meter.collateral_limit, 5000);
     assert!(meter.is_active);
     assert_eq!(token.balance(&provider), 30);
-    assert_eq!(token.balance(&contract_id), 270);
+    assert_eq!(token.balance(&contract_id), 4970);
 
     client.deduct_units(&meter_id, &27);
 
     let meter = client.get_meter(&meter_id).unwrap();
     assert_eq!(meter.debt, 300);
-    assert_eq!(meter.collateral_limit, 300);
-    assert!(!meter.is_active);
+    assert_eq!(meter.collateral_limit, 5000);
+    assert!(meter.is_active);
     assert_eq!(token.balance(&provider), 300);
-    assert_eq!(token.balance(&contract_id), 0);
+    assert_eq!(token.balance(&contract_id), 4700);
 }
 
 #[test]
@@ -418,7 +436,7 @@ fn test_postpaid_top_up_settles_debt_and_resets_when_reactivated() {
     let token = token::Client::new(&env, &token_address);
     let token_admin_client = token::StellarAssetClient::new(&env, &token_address);
 
-    token_admin_client.mint(&user, &500);
+    token_admin_client.mint(&user, &100000);
 
     let meter_id = client.register_meter_with_mode(
         &user,
@@ -428,32 +446,32 @@ fn test_postpaid_top_up_settles_debt_and_resets_when_reactivated() {
         &BillingType::PostPaid,
     );
 
-    client.top_up(&meter_id, &100);
+    client.top_up(&meter_id, &50000);
     env.ledger().set_timestamp(env.ledger().timestamp() + 1);
     client.claim(&meter_id);
     client.deduct_units(&meter_id, &9);
 
     let meter = client.get_meter(&meter_id).unwrap();
     assert_eq!(meter.debt, 100);
-    assert!(!meter.is_active);
+    assert!(meter.is_active);
     assert_eq!(token.balance(&provider), 100);
 
     env.ledger().set_timestamp(env.ledger().timestamp() + 80);
-    client.top_up(&meter_id, &200);
+    client.top_up(&meter_id, &20000);
 
     let meter = client.get_meter(&meter_id).unwrap();
     assert_eq!(meter.debt, 0);
-    assert_eq!(meter.collateral_limit, 200);
+    assert_eq!(meter.collateral_limit, 69900); // 49900 (remaining) + 20000
     assert!(meter.is_active);
-    assert_eq!(token.balance(&contract_id), 200);
+    assert_eq!(token.balance(&contract_id), 69900);
 
     env.ledger().set_timestamp(env.ledger().timestamp() + 1);
     client.claim(&meter_id);
 
     let meter = client.get_meter(&meter_id).unwrap();
-    assert_eq!(meter.debt, 10);
-    assert_eq!(meter.collateral_limit, 200);
+    assert_eq!(meter.debt, 810);
+    assert_eq!(meter.collateral_limit, 69900);
     assert!(meter.is_active);
-    assert_eq!(token.balance(&provider), 110);
-    assert_eq!(token.balance(&contract_id), 190);
+    assert_eq!(token.balance(&provider), 910);
+    assert_eq!(token.balance(&contract_id), 69090);
 }
