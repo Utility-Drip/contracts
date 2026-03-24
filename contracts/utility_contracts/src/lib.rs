@@ -6,6 +6,8 @@ use soroban_sdk::{
     Address, Env, Symbol,
 };
 
+mod fuzz_tests;
+
 #[contracttype]
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum BillingType {
@@ -80,6 +82,9 @@ pub enum ContractError {
     MeterNotFound = 1,
     OracleNotSet = 2,
     WithdrawalLimitExceeded = 3,
+    InvalidUsageValue = 4,
+    UsageExceedsLimit = 5,
+    InvalidPrecisionFactor = 6,
     InvalidSignature = 4,
     PublicKeyMismatch = 5,
     TimestampTooOld = 6,
@@ -91,6 +96,8 @@ pub struct UtilityContract;
 const HOUR_IN_SECONDS: u64 = 60 * 60;
 const DAY_IN_SECONDS: u64 = 24 * HOUR_IN_SECONDS;
 const DAILY_WITHDRAWAL_PERCENT: i128 = 10;
+const MAX_USAGE_PER_UPDATE: i128 = 1_000_000_000_000i128; // 1 billion kWh max per update
+const MIN_PRECISION_FACTOR: i128 = 1;
 const MAX_TIMESTAMP_DELAY: u64 = 300; // 5 minutes
 
 fn verify_usage_signature(env: &Env, signed_data: &SignedUsageData, meter: &Meter) -> Result<(), ContractError> {
@@ -506,6 +513,15 @@ impl UtilityContract {
     }
 
     pub fn update_usage(env: Env, meter_id: u64, watt_hours_consumed: i128) {
+        // Input validation for security
+        if watt_hours_consumed < 0 {
+            panic_with_error!(env, ContractError::InvalidUsageValue);
+        }
+        
+        if watt_hours_consumed > MAX_USAGE_PER_UPDATE {
+            panic_with_error!(env, ContractError::UsageExceedsLimit);
+        }
+        
         let mut meter = get_meter_or_panic(&env, meter_id);
         meter.user.require_auth();
 
@@ -553,6 +569,13 @@ impl UtilityContract {
         env.storage()
             .instance()
             .get(&DataKey::ProviderWindow(provider))
+    }
+
+    pub fn get_watt_hours_display(precise_watt_hours: i128, precision_factor: i128) -> i128 {
+        if precision_factor <= 0 {
+            return precise_watt_hours; // Fallback to avoid division by zero
+        }
+        precise_watt_hours / precision_factor
     }
 
     pub fn calculate_expected_depletion(env: Env, meter_id: u64) -> Option<u64> {
