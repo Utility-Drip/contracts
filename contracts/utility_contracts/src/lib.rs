@@ -2,14 +2,45 @@
 
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, panic_with_error, symbol_short, token,
-    Address, Env,
+    Address, Env, BytesN, Vec,
+    Address, Env, Symbol,
 };
+
+// Oracle client interface
+use soroban_sdk::contractclient;
+
+#[contractclient(name = "PriceOracleClient")]
+pub trait PriceOracle {
+    fn xlm_to_usd_cents(env: Env, xlm_amount: i128) -> i128;
+    fn usd_cents_to_xlm(env: Env, usd_cents: i128) -> i128;
+    fn get_price(env: Env) -> PriceData;
+}
+
+#[contracttype]
+#[derive(Clone)]
+pub struct PriceData {
+    pub price: i128,
+    pub decimals: u32,
+    pub last_updated: u64,
+}
+mod fuzz_tests;
 
 #[contracttype]
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum BillingType {
     PrePaid,
     PostPaid,
+}
+
+#[contracttype]
+#[derive(Clone)]
+pub struct SignedUsageData {
+    pub meter_id: u64,
+    pub timestamp: u64,
+    pub watt_hours_consumed: i128,
+    pub units_consumed: i128,
+    pub signature: BytesN<64>,
+    pub public_key: BytesN<32>,
 }
 
 #[contracttype]
@@ -28,7 +59,10 @@ pub struct Meter {
     pub user: Address,
     pub provider: Address,
     pub billing_type: BillingType,
+    pub off_peak_rate: i128,      // rate per second during off-peak hours
+    pub peak_rate: i128,          // rate per second during peak hours (1.5x off-peak)
     pub rate_per_second: i128,
+    pub rate_per_unit: i128,
     pub balance: i128,
     pub debt: i128,
     pub collateral_limit: i128,
@@ -40,6 +74,7 @@ pub struct Meter {
     pub last_claim_time: u64,
     pub claimed_this_hour: i128,
     pub heartbeat: u64,
+    pub device_public_key: BytesN<32>,
 }
 
 #[contracttype]
@@ -64,6 +99,14 @@ pub enum ContractError {
     MeterNotFound = 1,
     OracleNotSet = 2,
     WithdrawalLimitExceeded = 3,
+    PriceConversionFailed = 4,
+    InvalidTokenAmount = 5,
+    InvalidUsageValue = 4,
+    UsageExceedsLimit = 5,
+    InvalidPrecisionFactor = 6,
+    InvalidSignature = 4,
+    PublicKeyMismatch = 5,
+    TimestampTooOld = 6,
 }
 
 #[contract]
@@ -72,6 +115,46 @@ pub struct UtilityContract;
 const HOUR_IN_SECONDS: u64 = 60 * 60;
 const DAY_IN_SECONDS: u64 = 24 * HOUR_IN_SECONDS;
 const DAILY_WITHDRAWAL_PERCENT: i128 = 10;
+const MAX_USAGE_PER_UPDATE: i128 = 1_000_000_000_000i128; // 1 billion kWh max per update
+const MIN_PRECISION_FACTOR: i128 = 1;
+const MAX_TIMESTAMP_DELAY: u64 = 300; // 5 minutes
+
+fn verify_usage_signature(env: &Env, signed_data: &SignedUsageData, meter: &Meter) -> Result<(), ContractError> {
+    // Check if the provided public key matches the registered meter's public key
+    if signed_data.public_key != meter.device_public_key {
+        return Err(ContractError::PublicKeyMismatch);
+    }
+
+    // Check timestamp is not too old (prevent replay attacks)
+    let current_time = env.ledger().timestamp();
+    if current_time.saturating_sub(signed_data.timestamp) > MAX_TIMESTAMP_DELAY {
+        return Err(ContractError::TimestampTooOld);
+    }
+
+    // Create the message that was signed: meter_id || timestamp || watt_hours_consumed || units_consumed
+    let mut message = Vec::new(env);
+    message.push_back(&signed_data.meter_id);
+    message.push_back(&signed_data.timestamp);
+    message.push_back(&signed_data.watt_hours_consumed);
+    message.push_back(&signed_data.units_consumed);
+
+    // Verify the signature using Soroban's built-in signature verification
+    if env.crypto().ed25519_verify(
+        &signed_data.public_key,
+        &message.to_bytes(),
+        &signed_data.signature,
+    ) {
+        Ok(())
+    } else {
+        Err(ContractError::InvalidSignature)
+    }
+}
+
+// Peak hours: 18:00 - 21:00 UTC
+const PEAK_HOUR_START: u64 = 18 * HOUR_IN_SECONDS; // 64800 seconds
+const PEAK_HOUR_END: u64 = 21 * HOUR_IN_SECONDS;   // 75600 seconds
+const PEAK_RATE_MULTIPLIER: i128 = 3; // 1.5x => stored as 3 (divide by 2)
+const RATE_PRECISION: i128 = 2; // Precision for rate calculations
 
 /// Checks if an address represents the native Stellar asset (XLM)
 fn is_native_token(token_address: &Address) -> bool {
@@ -139,8 +222,56 @@ fn get_oracle_or_panic(env: &Env) -> Address {
     }
 }
 
+fn convert_xlm_to_usd_if_needed(env: &Env, amount: i128, token: &Address) -> Result<i128, ContractError> {
+    // Check if the token is XLM (native token)
+    // In Stellar, the native token has address = 0
+    if token.to_string().starts_with("CA") {
+        // This is a custom token, no conversion needed
+        return Ok(amount);
+    }
+    
+    // Assume native token is XLM, convert to USD cents
+    let oracle_address = get_oracle_or_panic(env);
+    let oracle_client = PriceOracleClient::new(env, &oracle_address);
+    
+    match oracle_client.xlm_to_usd_cents(&amount) {
+        result => Ok(result),
+        _ => Err(ContractError::PriceConversionFailed),
+    }
+}
+
+fn convert_usd_to_xlm_if_needed(env: &Env, usd_cents: i128, token: &Address) -> Result<i128, ContractError> {
+    // Check if the token is XLM (native token)
+    if token.to_string().starts_with("CA") {
+        // This is a custom token, no conversion needed
+        return Ok(usd_cents);
+    }
+    
+    // Assume native token is XLM, convert from USD cents to XLM
+    let oracle_address = get_oracle_or_panic(env);
+    let oracle_client = PriceOracleClient::new(env, &oracle_address);
+    
+    match oracle_client.usd_cents_to_xlm(&usd_cents) {
+        result => Ok(result),
+        _ => Err(ContractError::PriceConversionFailed),
+    }
+}
+
 fn remaining_postpaid_collateral(meter: &Meter) -> i128 {
     meter.collateral_limit.saturating_sub(meter.debt).max(0)
+}
+
+fn is_peak_hour(timestamp: u64) -> bool {
+    let seconds_in_day = timestamp % DAY_IN_SECONDS;
+    seconds_in_day >= PEAK_HOUR_START && seconds_in_day < PEAK_HOUR_END
+}
+
+fn get_effective_rate(meter: &Meter, timestamp: u64) -> i128 {
+    if is_peak_hour(timestamp) {
+        meter.peak_rate
+    } else {
+        meter.off_peak_rate
+    }
 }
 
 fn provider_meter_value(meter: &Meter) -> i128 {
@@ -279,19 +410,22 @@ impl UtilityContract {
         env: Env,
         user: Address,
         provider: Address,
-        rate: i128,
+        off_peak_rate: i128,
         token: Address,
+        device_public_key: BytesN<32>,
     ) -> u64 {
-        Self::register_meter_with_mode(env, user, provider, rate, token, BillingType::PrePaid)
+        Self::register_meter_with_mode(env, user, provider, rate, token, BillingType::PrePaid, device_public_key)
+        Self::register_meter_with_mode(env, user, provider, off_peak_rate, token, BillingType::PrePaid)
     }
 
     pub fn register_meter_with_mode(
         env: Env,
         user: Address,
         provider: Address,
-        rate: i128,
+        off_peak_rate: i128,
         token: Address,
         billing_type: BillingType,
+        device_public_key: BytesN<32>,
     ) -> u64 {
         user.require_auth();
 
@@ -303,6 +437,8 @@ impl UtilityContract {
         count += 1;
 
         let now = env.ledger().timestamp();
+        let peak_rate = off_peak_rate.saturating_mul(PEAK_RATE_MULTIPLIER) / RATE_PRECISION;
+        
         let usage_data = UsageData {
             total_watt_hours: 0,
             current_cycle_watt_hours: 0,
@@ -315,7 +451,10 @@ impl UtilityContract {
             user,
             provider,
             billing_type,
+            off_peak_rate,
+            peak_rate,
             rate_per_second: rate,
+            rate_per_unit: rate,
             balance: 0,
             debt: 0,
             collateral_limit: 0,
@@ -323,10 +462,11 @@ impl UtilityContract {
             is_active: false,
             token,
             usage_data,
-            max_flow_rate_per_hour: rate.saturating_mul(HOUR_IN_SECONDS as i128),
+            max_flow_rate_per_hour: off_peak_rate.saturating_mul(HOUR_IN_SECONDS as i128),
             last_claim_time: now,
             claimed_this_hour: 0,
             heartbeat: now,
+            device_public_key,
         };
 
         env.storage().instance().set(&DataKey::Meter(count), &meter);
@@ -340,17 +480,30 @@ impl UtilityContract {
 
         let was_active = meter.is_active;
         transfer_tokens(&env, &meter.token, &meter.user, &env.current_contract_address(), &amount);
+        let client = token::Client::new(&env, &meter.token);
+        
+        // Convert XLM to USD cents if needed
+        let converted_amount = match convert_xlm_to_usd_if_needed(&env, amount, &meter.token) {
+            Ok(amount) => amount,
+            Err(_) => panic_with_error!(&env, ContractError::PriceConversionFailed),
+        };
+        
+        if converted_amount <= 0 {
+            panic_with_error!(&env, ContractError::InvalidTokenAmount);
+        }
+        
+        client.transfer(&meter.user, &env.current_contract_address(), &amount);
 
         match meter.billing_type {
             BillingType::PrePaid => {
-                meter.balance = meter.balance.saturating_add(amount);
+                meter.balance = meter.balance.saturating_add(converted_amount);
             }
             BillingType::PostPaid => {
-                let settlement = amount.min(meter.debt.max(0));
+                let settlement = converted_amount.min(meter.debt.max(0));
                 meter.debt = meter.debt.saturating_sub(settlement);
                 meter.collateral_limit = meter
                     .collateral_limit
-                    .saturating_add(amount.saturating_sub(settlement));
+                    .saturating_add(converted_amount.saturating_sub(settlement));
             }
         }
 
@@ -364,6 +517,14 @@ impl UtilityContract {
 
         if !was_active && meter.is_active {
             publish_active_event(&env, meter_id, now);
+        }
+        
+        // Emit conversion event if XLM was used
+        if !meter.token.to_string().starts_with("CA") {
+            env.events().publish(
+                (symbol_short!("XLMtoUSD"), meter_id), 
+                (amount, converted_amount)
+            );
         }
     }
 
@@ -381,7 +542,8 @@ impl UtilityContract {
         reset_claim_window_if_needed(&mut meter, now);
 
         let elapsed = now.saturating_sub(meter.last_update);
-        let requested = (elapsed as i128).saturating_mul(meter.rate_per_second);
+        let effective_rate = get_effective_rate(&meter, now);
+        let requested = (elapsed as i128).saturating_mul(effective_rate);
         let claimable = requested
             .min(remaining_claim_capacity(&meter))
             .min(provider_meter_value(&meter));
@@ -406,16 +568,42 @@ impl UtilityContract {
         }
     }
 
-    pub fn deduct_units(env: Env, meter_id: u64, units_consumed: i128) {
+    pub fn update_device_public_key(env: Env, meter_id: u64, new_public_key: BytesN<32>) {
+        let mut meter = get_meter_or_panic(&env, meter_id);
+        meter.user.require_auth();
+        meter.device_public_key = new_public_key;
+        env.storage().instance().set(&DataKey::Meter(meter_id), &meter);
+    }
+
+    pub fn deduct_units(env: Env, signed_data: SignedUsageData) {
         let oracle = get_oracle_or_panic(&env);
         oracle.require_auth();
 
-        let mut meter = get_meter_or_panic(&env, meter_id);
+        let mut meter = get_meter_or_panic(&env, signed_data.meter_id);
+        
+        // Verify the signature matches the registered device public key
+        verify_usage_signature(&env, &signed_data, &meter)
+            .unwrap_or_else(|e| panic_with_error!(&env, e));
+
         let now = env.ledger().timestamp();
         reset_claim_window_if_needed(&mut meter, now);
 
-        let requested = units_consumed.saturating_mul(meter.rate_per_second);
+        let requested = signed_data.units_consumed.saturating_mul(meter.rate_per_second);
+        let effective_rate = get_effective_rate(&meter, now);
+        let requested = units_consumed.saturating_mul(effective_rate);
         let claimable = requested
+        // Peak hour tariff logic from Issue #13
+        let current_hour = (now % 86400) / 3600;
+        let is_peak = current_hour >= 18 && current_hour < 22; // 6 PM to 10 PM UTC
+        let base_cost = units_consumed.saturating_mul(meter.rate_per_unit);
+        let cost = if is_peak {
+            base_cost.saturating_mul(15) / 10
+        } else {
+            base_cost
+        };
+
+        // Enforce max flow rate hourly cap and available funds
+        let claimable = cost
             .min(remaining_claim_capacity(&meter))
             .min(provider_meter_value(&meter));
 
@@ -424,14 +612,14 @@ impl UtilityContract {
         meter.last_update = now;
         refresh_activity(&mut meter);
 
-        env.storage().instance().set(&DataKey::Meter(meter_id), &meter);
+        env.storage().instance().set(&DataKey::Meter(signed_data.meter_id), &meter);
 
         if was_active && !meter.is_active {
-            publish_inactive_event(&env, meter_id, now);
+            publish_inactive_event(&env, signed_data.meter_id, now);
         }
 
         env.events()
-            .publish((symbol_short!("Usage"), meter_id), (units_consumed, claimable));
+            .publish((symbol_short!("Usage"), signed_data.meter_id), (signed_data.units_consumed, claimable));
     }
 
     pub fn set_max_flow_rate(env: Env, meter_id: u64, max_flow_rate_per_hour: i128) {
@@ -442,6 +630,15 @@ impl UtilityContract {
     }
 
     pub fn update_usage(env: Env, meter_id: u64, watt_hours_consumed: i128) {
+        // Input validation for security
+        if watt_hours_consumed < 0 {
+            panic_with_error!(env, ContractError::InvalidUsageValue);
+        }
+        
+        if watt_hours_consumed > MAX_USAGE_PER_UPDATE {
+            panic_with_error!(env, ContractError::UsageExceedsLimit);
+        }
+        
         let mut meter = get_meter_or_panic(&env, meter_id);
         meter.user.require_auth();
 
@@ -492,6 +689,9 @@ impl UtilityContract {
     }
 
     pub fn get_watt_hours_display(precise_watt_hours: i128, precision_factor: i128) -> i128 {
+        if precision_factor <= 0 {
+            return precise_watt_hours; // Fallback to avoid division by zero
+        }
         precise_watt_hours / precision_factor
     }
 
@@ -500,7 +700,8 @@ impl UtilityContract {
             .instance()
             .get::<DataKey, Meter>(&DataKey::Meter(meter_id))
             .map(|meter| {
-                if meter.rate_per_second <= 0 {
+                if meter.off_peak_rate <= 0 {
+                if meter.rate_per_unit <= 0 {
                     return 0;
                 }
 
@@ -509,7 +710,9 @@ impl UtilityContract {
                     return 0;
                 }
 
-                env.ledger().timestamp() + (available / meter.rate_per_second) as u64
+                env.ledger().timestamp() + (available / meter.off_peak_rate) as u64
+                env.ledger().timestamp()
+                    + (available / meter.rate_per_unit) as u64
             })
     }
 
@@ -527,6 +730,66 @@ impl UtilityContract {
         env.storage().instance().set(&DataKey::Meter(meter_id), &meter);
     }
 
+    pub fn withdraw_earnings(env: Env, meter_id: u64, amount_usd_cents: i128) {
+        let mut meter = get_meter_or_panic(&env, meter_id);
+        meter.provider.require_auth();
+        
+        if amount_usd_cents <= 0 {
+            panic_with_error!(&env, ContractError::InvalidTokenAmount);
+        }
+        
+        let available_earnings = match meter.billing_type {
+            BillingType::PrePaid => meter.balance,
+            BillingType::PostPaid => meter.debt,
+        };
+        
+        if amount_usd_cents > available_earnings {
+            panic_with_error!(&env, ContractError::InvalidTokenAmount);
+        }
+        
+        // Convert USD cents to XLM if needed
+        let withdrawal_amount = match convert_usd_to_xlm_if_needed(&env, amount_usd_cents, &meter.token) {
+            Ok(amount) => amount,
+            Err(_) => panic_with_error!(&env, ContractError::PriceConversionFailed),
+        };
+        
+        let client = token::Client::new(&env, &meter.token);
+        client.transfer(&env.current_contract_address(), &meter.provider, &withdrawal_amount);
+        
+        // Update meter balance/debt
+        match meter.billing_type {
+            BillingType::PrePaid => {
+                meter.balance = meter.balance.saturating_sub(amount_usd_cents);
+            }
+            BillingType::PostPaid => {
+                meter.debt = meter.debt.saturating_sub(amount_usd_cents);
+            }
+        }
+        
+        let now = env.ledger().timestamp();
+        refresh_activity(&mut meter);
+        meter.last_update = now;
+        env.storage().instance().set(&DataKey::Meter(meter_id), &meter);
+        
+        // Emit conversion event if XLM was used
+        if !meter.token.to_string().starts_with("CA") {
+            env.events().publish(
+                (symbol_short!("USDtoXLM"), meter_id), 
+                (amount_usd_cents, withdrawal_amount)
+            );
+        }
+    }
+
+    pub fn get_current_rate(env: Env) -> Option<PriceData> {
+        match env.storage().instance().get::<DataKey, Address>(&DataKey::Oracle) {
+            Some(oracle_address) => {
+                let oracle_client = PriceOracleClient::new(&env, &oracle_address);
+                Some(oracle_client.get_price())
+            }
+            None => None,
+        }
+    }
+
     pub fn is_meter_offline(env: Env, meter_id: u64) -> bool {
         match env
             .storage()
@@ -538,6 +801,10 @@ impl UtilityContract {
             }
             None => true,
         }
+    }
+
+    pub fn get_watt_hours_display(watt_hours: i128, precision_factor: i128) -> i128 {
+        watt_hours / precision_factor
     }
 }
 
