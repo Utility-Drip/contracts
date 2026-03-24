@@ -1,6 +1,9 @@
 #![no_std]
 use soroban_sdk::{contract, contracttype, contractimpl, Address, Env, token};
 
+// Minimum balance required to keep the IoT relay open (5 XLM equivalent)
+const MINIMUM_BALANCE_TO_FLOW: i128 = 5000000; // 5 XLM in stroops (1 XLM = 10^7 stroops)
+
 #[contracttype]
 #[derive(Clone)]
 pub struct UsageData {
@@ -35,6 +38,10 @@ pub struct UtilityContract;
 
 #[contractimpl]
 impl UtilityContract {
+    pub fn get_minimum_balance_to_flow() -> i128 {
+        MINIMUM_BALANCE_TO_FLOW
+    }
+
     pub fn register_meter(
         env: Env,
         user: Address,
@@ -78,7 +85,9 @@ impl UtilityContract {
         client.transfer(&meter.user, &env.current_contract_address(), &amount);
 
         meter.balance += amount;
-        meter.is_active = true;
+        
+        // Only activate if balance meets minimum requirement
+        meter.is_active = meter.balance >= MINIMUM_BALANCE_TO_FLOW;
         meter.last_update = env.ledger().timestamp();
         
         env.storage().instance().set(&DataKey::Meter(meter_id), &meter);
@@ -106,7 +115,8 @@ impl UtilityContract {
         }
 
         meter.last_update = now;
-        if meter.balance <= 0 {
+        // Deactivate if balance falls below minimum requirement
+        if meter.balance < MINIMUM_BALANCE_TO_FLOW {
             meter.is_active = false;
         }
 
