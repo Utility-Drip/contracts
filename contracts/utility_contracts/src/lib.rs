@@ -1,8 +1,16 @@
 #![no_std]
+
 use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, panic_with_error, token, Address, Env,
-    Symbol,
+    contract, contracterror, contractimpl, contracttype, panic_with_error, symbol_short, token,
+    Address, Env,
 };
+
+#[contracttype]
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum BillingType {
+    PrePaid,
+    PostPaid,
+}
 
 #[contracttype]
 #[derive(Clone)]
@@ -19,8 +27,11 @@ pub struct UsageData {
 pub struct Meter {
     pub user: Address,
     pub provider: Address,
-    pub rate_per_unit: i128,
+    pub billing_type: BillingType,
+    pub rate_per_second: i128,
     pub balance: i128,
+    pub debt: i128,
+    pub collateral_limit: i128,
     pub last_update: u64,
     pub is_active: bool,
     pub token: Address,
@@ -58,25 +69,66 @@ pub enum ContractError {
 #[contract]
 pub struct UtilityContract;
 
-const DAY_IN_SECONDS: u64 = 24 * 60 * 60;
 const HOUR_IN_SECONDS: u64 = 60 * 60;
+const DAY_IN_SECONDS: u64 = 24 * HOUR_IN_SECONDS;
 const DAILY_WITHDRAWAL_PERCENT: i128 = 10;
 
 fn get_meter_or_panic(env: &Env, meter_id: u64) -> Meter {
-    match env.storage().instance().get(&DataKey::Meter(meter_id)) {
+    match env
+        .storage()
+        .instance()
+        .get::<DataKey, Meter>(&DataKey::Meter(meter_id))
+    {
         Some(meter) => meter,
         None => panic_with_error!(env, ContractError::MeterNotFound),
     }
 }
 
 fn get_oracle_or_panic(env: &Env) -> Address {
-    match env.storage().instance().get(&DataKey::Oracle) {
+    match env
+        .storage()
+        .instance()
+        .get::<DataKey, Address>(&DataKey::Oracle)
+    {
         Some(oracle) => oracle,
         None => panic_with_error!(env, ContractError::OracleNotSet),
     }
 }
 
-fn get_provider_window(env: &Env, provider: &Address, now: u64) -> ProviderWithdrawalWindow {
+fn remaining_postpaid_collateral(meter: &Meter) -> i128 {
+    meter.collateral_limit.saturating_sub(meter.debt).max(0)
+}
+
+fn provider_meter_value(meter: &Meter) -> i128 {
+    match meter.billing_type {
+        BillingType::PrePaid => meter.balance.max(0),
+        BillingType::PostPaid => remaining_postpaid_collateral(meter),
+    }
+}
+
+fn refresh_activity(meter: &mut Meter) {
+    meter.is_active = provider_meter_value(meter) > 0;
+}
+
+fn reset_claim_window_if_needed(meter: &mut Meter, now: u64) {
+    if now.saturating_sub(meter.last_claim_time) >= HOUR_IN_SECONDS {
+        meter.claimed_this_hour = 0;
+        meter.last_claim_time = now;
+    }
+}
+
+fn remaining_claim_capacity(meter: &Meter) -> i128 {
+    meter
+        .max_flow_rate_per_hour
+        .saturating_sub(meter.claimed_this_hour)
+        .max(0)
+}
+
+fn get_provider_window_or_default(
+    env: &Env,
+    provider: &Address,
+    now: u64,
+) -> ProviderWithdrawalWindow {
     env.storage()
         .instance()
         .get(&DataKey::ProviderWindow(provider.clone()))
@@ -94,10 +146,14 @@ fn reset_provider_window_if_needed(window: &mut ProviderWithdrawalWindow, now: u
 }
 
 fn get_provider_total_pool(env: &Env, provider: &Address) -> i128 {
-    let count: u64 = env.storage().instance().get(&DataKey::Count).unwrap_or(0);
-    let mut total_pool = 0;
-
+    let count = env
+        .storage()
+        .instance()
+        .get::<DataKey, u64>(&DataKey::Count)
+        .unwrap_or(0);
+    let mut total_pool: i128 = 0;
     let mut meter_id = 1;
+
     while meter_id <= count {
         if let Some(meter) = env
             .storage()
@@ -105,9 +161,10 @@ fn get_provider_total_pool(env: &Env, provider: &Address) -> i128 {
             .get::<DataKey, Meter>(&DataKey::Meter(meter_id))
         {
             if meter.provider == *provider {
-                total_pool += meter.balance;
+                total_pool = total_pool.saturating_add(provider_meter_value(&meter));
             }
         }
+
         meter_id += 1;
     }
 
@@ -120,16 +177,16 @@ fn apply_provider_withdrawal_limit(
     amount: i128,
 ) -> ProviderWithdrawalWindow {
     let now = env.ledger().timestamp();
-    let mut window = get_provider_window(env, provider, now);
+    let mut window = get_provider_window_or_default(env, provider, now);
     reset_provider_window_if_needed(&mut window, now);
 
     if amount <= 0 {
         return window;
     }
 
-    let provider_total_pool =
+    let total_pool_before_claim =
         get_provider_total_pool(env, provider).saturating_add(window.daily_withdrawn);
-    let daily_limit = provider_total_pool / DAILY_WITHDRAWAL_PERCENT;
+    let daily_limit = total_pool_before_claim / DAILY_WITHDRAWAL_PERCENT;
 
     if window.daily_withdrawn.saturating_add(amount) > daily_limit {
         panic_with_error!(env, ContractError::WithdrawalLimitExceeded);
@@ -139,11 +196,34 @@ fn apply_provider_withdrawal_limit(
     window
 }
 
-fn reset_hourly_claim_if_needed(meter: &mut Meter, now: u64) {
-    if now.saturating_sub(meter.last_claim_time) >= HOUR_IN_SECONDS {
-        meter.claimed_this_hour = 0;
-        meter.last_claim_time = now;
+fn apply_provider_claim(env: &Env, meter: &mut Meter, amount: i128) {
+    if amount <= 0 {
+        return;
     }
+
+    let client = token::Client::new(env, &meter.token);
+    client.transfer(&env.current_contract_address(), &meter.provider, &amount);
+
+    match meter.billing_type {
+        BillingType::PrePaid => {
+            meter.balance = meter.balance.saturating_sub(amount);
+        }
+        BillingType::PostPaid => {
+            meter.debt = meter.debt.saturating_add(amount);
+        }
+    }
+
+    meter.claimed_this_hour = meter.claimed_this_hour.saturating_add(amount);
+}
+
+fn publish_active_event(env: &Env, meter_id: u64, now: u64) {
+    env.events()
+        .publish((symbol_short!("Active"), meter_id), now);
+}
+
+fn publish_inactive_event(env: &Env, meter_id: u64, now: u64) {
+    env.events()
+        .publish((symbol_short!("Inactive"), meter_id), now);
 }
 
 #[contractimpl]
@@ -159,8 +239,24 @@ impl UtilityContract {
         rate: i128,
         token: Address,
     ) -> u64 {
+        Self::register_meter_with_mode(env, user, provider, rate, token, BillingType::PrePaid)
+    }
+
+    pub fn register_meter_with_mode(
+        env: Env,
+        user: Address,
+        provider: Address,
+        rate: i128,
+        token: Address,
+        billing_type: BillingType,
+    ) -> u64 {
         user.require_auth();
-        let mut count: u64 = env.storage().instance().get(&DataKey::Count).unwrap_or(0);
+
+        let mut count = env
+            .storage()
+            .instance()
+            .get::<DataKey, u64>(&DataKey::Count)
+            .unwrap_or(0);
         count += 1;
 
         let now = env.ledger().timestamp();
@@ -175,13 +271,16 @@ impl UtilityContract {
         let meter = Meter {
             user,
             provider,
-            rate_per_unit: rate,
+            billing_type,
+            rate_per_second: rate,
             balance: 0,
+            debt: 0,
+            collateral_limit: 0,
             last_update: now,
             is_active: false,
             token,
             usage_data,
-            max_flow_rate_per_hour: rate * 3600,
+            max_flow_rate_per_hour: rate.saturating_mul(HOUR_IN_SECONDS as i128),
             last_claim_time: now,
             claimed_this_hour: 0,
             heartbeat: now,
@@ -196,64 +295,34 @@ impl UtilityContract {
         let mut meter = get_meter_or_panic(&env, meter_id);
         meter.user.require_auth();
 
+        let was_active = meter.is_active;
         let client = token::Client::new(&env, &meter.token);
         client.transfer(&meter.user, &env.current_contract_address(), &amount);
 
-        meter.balance += amount;
-        meter.is_active = true;
-        meter.last_update = env.ledger().timestamp();
-
-        env.storage()
-            .instance()
-            .set(&DataKey::Meter(meter_id), &meter);
-    }
-
-    pub fn deduct_units(env: Env, meter_id: u64, units_consumed: i128) {
-        let oracle = get_oracle_or_panic(&env);
-        oracle.require_auth();
-
-        let mut meter = get_meter_or_panic(&env, meter_id);
-        let cost = units_consumed.saturating_mul(meter.rate_per_unit);
-
-        if cost > 0 {
-            let actual_claim = if cost > meter.balance {
-                meter.balance
-            } else {
-                cost
-            };
-
-            if actual_claim > 0 {
-                let client = token::Client::new(&env, &meter.token);
-                client.transfer(
-                    &env.current_contract_address(),
-                    &meter.provider,
-                    &actual_claim,
-                );
-                meter.balance -= actual_claim;
+        match meter.billing_type {
+            BillingType::PrePaid => {
+                meter.balance = meter.balance.saturating_add(amount);
+            }
+            BillingType::PostPaid => {
+                let settlement = amount.min(meter.debt.max(0));
+                meter.debt = meter.debt.saturating_sub(settlement);
+                meter.collateral_limit = meter
+                    .collateral_limit
+                    .saturating_add(amount.saturating_sub(settlement));
             }
         }
 
-        meter.last_update = env.ledger().timestamp();
-        if meter.balance <= 0 {
-            meter.is_active = false;
+        let now = env.ledger().timestamp();
+        refresh_activity(&mut meter);
+        if !was_active && meter.is_active {
+            meter.last_update = now;
         }
 
-        env.storage()
-            .instance()
-            .set(&DataKey::Meter(meter_id), &meter);
-        env.events().publish(
-            (Symbol::new(&env, "UsageReported"), meter_id),
-            (units_consumed, cost),
-        );
-    }
+        env.storage().instance().set(&DataKey::Meter(meter_id), &meter);
 
-    pub fn set_max_flow_rate(env: Env, meter_id: u64, max_flow_rate_per_hour: i128) {
-        let mut meter = get_meter_or_panic(&env, meter_id);
-        meter.provider.require_auth();
-        meter.max_flow_rate_per_hour = max_flow_rate_per_hour;
-        env.storage()
-            .instance()
-            .set(&DataKey::Meter(meter_id), &meter);
+        if !was_active && meter.is_active {
+            publish_active_event(&env, meter_id, now);
+        }
     }
 
     pub fn claim(env: Env, meter_id: u64) {
@@ -261,43 +330,73 @@ impl UtilityContract {
         meter.provider.require_auth();
 
         let now = env.ledger().timestamp();
-        reset_hourly_claim_if_needed(&mut meter, now);
-
-        let elapsed = now.checked_sub(meter.last_update).unwrap_or(0);
-        let accrued = (elapsed as i128).saturating_mul(meter.rate_per_unit);
-        let hourly_allowance = meter
-            .max_flow_rate_per_hour
-            .saturating_sub(meter.claimed_this_hour);
-
-        let mut claimable = if accrued > meter.balance {
-            meter.balance
-        } else {
-            accrued
-        };
-        if claimable > hourly_allowance {
-            claimable = hourly_allowance;
+        if !meter.is_active {
+            meter.last_update = now;
+            env.storage().instance().set(&DataKey::Meter(meter_id), &meter);
+            return;
         }
 
+        reset_claim_window_if_needed(&mut meter, now);
+
+        let elapsed = now.saturating_sub(meter.last_update);
+        let requested = (elapsed as i128).saturating_mul(meter.rate_per_second);
+        let claimable = requested
+            .min(remaining_claim_capacity(&meter))
+            .min(provider_meter_value(&meter));
+
         if claimable > 0 {
-            let provider_window = apply_provider_withdrawal_limit(&env, &meter.provider, claimable);
-            let client = token::Client::new(&env, &meter.token);
-            client.transfer(&env.current_contract_address(), &meter.provider, &claimable);
-            meter.balance -= claimable;
-            meter.claimed_this_hour = meter.claimed_this_hour.saturating_add(claimable);
+            let provider_window =
+                apply_provider_withdrawal_limit(&env, &meter.provider, claimable);
+            apply_provider_claim(&env, &mut meter, claimable);
             env.storage().instance().set(
                 &DataKey::ProviderWindow(meter.provider.clone()),
                 &provider_window,
             );
         }
 
+        let was_active = meter.is_active;
         meter.last_update = now;
-        if meter.balance <= 0 {
-            meter.is_active = false;
+        refresh_activity(&mut meter);
+        env.storage().instance().set(&DataKey::Meter(meter_id), &meter);
+
+        if was_active && !meter.is_active {
+            publish_inactive_event(&env, meter_id, now);
+        }
+    }
+
+    pub fn deduct_units(env: Env, meter_id: u64, units_consumed: i128) {
+        let oracle = get_oracle_or_panic(&env);
+        oracle.require_auth();
+
+        let mut meter = get_meter_or_panic(&env, meter_id);
+        let now = env.ledger().timestamp();
+        reset_claim_window_if_needed(&mut meter, now);
+
+        let requested = units_consumed.saturating_mul(meter.rate_per_second);
+        let claimable = requested
+            .min(remaining_claim_capacity(&meter))
+            .min(provider_meter_value(&meter));
+
+        let was_active = meter.is_active;
+        apply_provider_claim(&env, &mut meter, claimable);
+        meter.last_update = now;
+        refresh_activity(&mut meter);
+
+        env.storage().instance().set(&DataKey::Meter(meter_id), &meter);
+
+        if was_active && !meter.is_active {
+            publish_inactive_event(&env, meter_id, now);
         }
 
-        env.storage()
-            .instance()
-            .set(&DataKey::Meter(meter_id), &meter);
+        env.events()
+            .publish((symbol_short!("Usage"), meter_id), (units_consumed, claimable));
+    }
+
+    pub fn set_max_flow_rate(env: Env, meter_id: u64, max_flow_rate_per_hour: i128) {
+        let mut meter = get_meter_or_panic(&env, meter_id);
+        meter.provider.require_auth();
+        meter.max_flow_rate_per_hour = max_flow_rate_per_hour.max(0);
+        env.storage().instance().set(&DataKey::Meter(meter_id), &meter);
     }
 
     pub fn update_usage(env: Env, meter_id: u64, watt_hours_consumed: i128) {
@@ -320,20 +419,15 @@ impl UtilityContract {
         }
 
         meter.usage_data.last_reading_timestamp = env.ledger().timestamp();
-        env.storage()
-            .instance()
-            .set(&DataKey::Meter(meter_id), &meter);
+        env.storage().instance().set(&DataKey::Meter(meter_id), &meter);
     }
 
     pub fn reset_cycle_usage(env: Env, meter_id: u64) {
         let mut meter = get_meter_or_panic(&env, meter_id);
         meter.provider.require_auth();
-
         meter.usage_data.current_cycle_watt_hours = 0;
         meter.usage_data.last_reading_timestamp = env.ledger().timestamp();
-        env.storage()
-            .instance()
-            .set(&DataKey::Meter(meter_id), &meter);
+        env.storage().instance().set(&DataKey::Meter(meter_id), &meter);
     }
 
     pub fn get_usage_data(env: Env, meter_id: u64) -> Option<UsageData> {
@@ -344,7 +438,9 @@ impl UtilityContract {
     }
 
     pub fn get_meter(env: Env, meter_id: u64) -> Option<Meter> {
-        env.storage().instance().get(&DataKey::Meter(meter_id))
+        env.storage()
+            .instance()
+            .get::<DataKey, Meter>(&DataKey::Meter(meter_id))
     }
 
     pub fn get_provider_window(env: Env, provider: Address) -> Option<ProviderWithdrawalWindow> {
@@ -362,11 +458,16 @@ impl UtilityContract {
             .instance()
             .get::<DataKey, Meter>(&DataKey::Meter(meter_id))
             .map(|meter| {
-                if meter.balance <= 0 || meter.rate_per_unit <= 0 {
-                    0
-                } else {
-                    env.ledger().timestamp() + (meter.balance / meter.rate_per_unit) as u64
+                if meter.rate_per_second <= 0 {
+                    return 0;
                 }
+
+                let available = provider_meter_value(&meter);
+                if available <= 0 {
+                    return 0;
+                }
+
+                env.ledger().timestamp() + (available / meter.rate_per_second) as u64
             })
     }
 
@@ -374,18 +475,14 @@ impl UtilityContract {
         let mut meter = get_meter_or_panic(&env, meter_id);
         meter.provider.require_auth();
         meter.is_active = false;
-        env.storage()
-            .instance()
-            .set(&DataKey::Meter(meter_id), &meter);
+        env.storage().instance().set(&DataKey::Meter(meter_id), &meter);
     }
 
     pub fn update_heartbeat(env: Env, meter_id: u64) {
         let mut meter = get_meter_or_panic(&env, meter_id);
         meter.user.require_auth();
         meter.heartbeat = env.ledger().timestamp();
-        env.storage()
-            .instance()
-            .set(&DataKey::Meter(meter_id), &meter);
+        env.storage().instance().set(&DataKey::Meter(meter_id), &meter);
     }
 
     pub fn is_meter_offline(env: Env, meter_id: u64) -> bool {
