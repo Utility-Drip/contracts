@@ -102,6 +102,7 @@ pub enum DataKey {
     Count,
     Oracle,
     PairingChallenge(u64),
+    Admin,
 }
 
 #[contracterror]
@@ -123,6 +124,8 @@ pub enum ContractError {
     ChallengeNotFound = 13,
     InvalidPairingSignature = 14,
     MeterNotPaired = 15,
+    AlreadyInitialized = 100,
+    Unauthorized = 101,
 }
 
 #[contracttype]
@@ -388,7 +391,17 @@ fn publish_inactive_event(env: &Env, meter_id: u64, now: u64) {
 
 #[contractimpl]
 impl UtilityContract {
+    pub fn initialize(env: Env, admin: Address) {
+        if env.storage().instance().has(&DataKey::Admin) {
+            panic_with_error!(&env, ContractError::AlreadyInitialized);
+        }
+        env.storage().instance().set(&DataKey::Admin, &admin);
+    }
+
     pub fn set_oracle(env: Env, oracle: Address) {
+        let admin: Address = env.storage().instance().get(&DataKey::Admin)
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::Unauthorized));
+        admin.require_auth();
         env.storage().instance().set(&DataKey::Oracle, &oracle);
     }
 
@@ -421,6 +434,7 @@ impl UtilityContract {
         device_public_key: BytesN<32>,
     ) -> u64 {
         user.require_auth();
+        provider.require_auth();
 
         let mut count = env
             .storage()

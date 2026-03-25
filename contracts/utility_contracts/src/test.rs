@@ -67,6 +67,7 @@ fn test_prepaid_meter_flow() {
 
     let contract_id = env.register(UtilityContract, ());
     let client = UtilityContractClient::new(&env, &contract_id);
+    client.initialize(&Address::generate(&env));
 
     let user = Address::generate(&env);
     let provider = Address::generate(&env);
@@ -182,6 +183,7 @@ fn test_peak_hour_tariff() {
 
     let contract_id = env.register(UtilityContract, ());
     let client = UtilityContractClient::new(&env, &contract_id);
+    client.initialize(&Address::generate(&env));
 
     let user = Address::generate(&env);
     let provider = Address::generate(&env);
@@ -238,6 +240,7 @@ fn test_calculate_expected_depletion() {
 
     let contract_id = env.register(UtilityContract, ());
     let client = UtilityContractClient::new(&env, &contract_id);
+    client.initialize(&Address::generate(&env));
 
     let user = Address::generate(&env);
     let provider = Address::generate(&env);
@@ -266,6 +269,7 @@ fn test_emergency_shutdown() {
 
     let contract_id = env.register(UtilityContract, ());
     let client = UtilityContractClient::new(&env, &contract_id);
+    client.initialize(&Address::generate(&env));
 
     let user = Address::generate(&env);
     let provider = Address::generate(&env);
@@ -297,6 +301,7 @@ fn test_heartbeat_functionality() {
 
     let contract_id = env.register(UtilityContract, ());
     let client = UtilityContractClient::new(&env, &contract_id);
+    client.initialize(&Address::generate(&env));
 
     let user = Address::generate(&env);
     let provider = Address::generate(&env);
@@ -327,6 +332,7 @@ fn test_claim_within_daily_limit_tracks_withdrawn() {
 
     let contract_id = env.register(UtilityContract, ());
     let client = UtilityContractClient::new(&env, &contract_id);
+    client.initialize(&Address::generate(&env));
 
     let user = Address::generate(&env);
     let provider = Address::generate(&env);
@@ -363,6 +369,7 @@ fn test_claim_reverts_when_daily_limit_is_exceeded() {
 
     let contract_id = env.register(UtilityContract, ());
     let client = UtilityContractClient::new(&env, &contract_id);
+    client.initialize(&Address::generate(&env));
 
     let user = Address::generate(&env);
     let provider = Address::generate(&env);
@@ -389,6 +396,7 @@ fn test_daily_limit_resets_after_24_hours() {
 
     let contract_id = env.register(UtilityContract, ());
     let client = UtilityContractClient::new(&env, &contract_id);
+    client.initialize(&Address::generate(&env));
 
     let user = Address::generate(&env);
     let provider = Address::generate(&env);
@@ -429,6 +437,7 @@ fn test_daily_limit_is_shared_across_provider_meters() {
 
     let contract_id = env.register(UtilityContract, ());
     let client = UtilityContractClient::new(&env, &contract_id);
+    client.initialize(&Address::generate(&env));
 
     let user_one = Address::generate(&env);
     let user_two = Address::generate(&env);
@@ -464,6 +473,7 @@ fn test_postpaid_claims_against_collateral_limit() {
 
     let contract_id = env.register(UtilityContract, ());
     let client = UtilityContractClient::new(&env, &contract_id);
+    client.initialize(&Address::generate(&env));
 
     let user = Address::generate(&env);
     let provider = Address::generate(&env);
@@ -537,6 +547,7 @@ fn test_postpaid_top_up_settles_debt_and_resets_when_reactivated() {
 
     let contract_id = env.register(UtilityContract, ());
     let client = UtilityContractClient::new(&env, &contract_id);
+    client.initialize(&Address::generate(&env));
 
     let user = Address::generate(&env);
     let provider = Address::generate(&env);
@@ -611,6 +622,7 @@ fn test_variable_rate_tariffs_peak_vs_offpeak() {
 
     let contract_id = env.register(UtilityContract, ());
     let client = UtilityContractClient::new(&env, &contract_id);
+    client.initialize(&Address::generate(&env));
 
     let user = Address::generate(&env);
     let provider = Address::generate(&env);
@@ -676,6 +688,7 @@ fn test_variable_rate_deduct_units_respects_peak_hours() {
 
     let contract_id = env.register(UtilityContract, ());
     let client = UtilityContractClient::new(&env, &contract_id);
+    client.initialize(&Address::generate(&env));
 
     let user = Address::generate(&env);
     let provider = Address::generate(&env);
@@ -740,6 +753,7 @@ fn test_signature_verification_success() {
 
     let contract_id = env.register(UtilityContract, ());
     let client = UtilityContractClient::new(&env, &contract_id);
+    client.initialize(&Address::generate(&env));
 
     let user = Address::generate(&env);
     let provider = Address::generate(&env);
@@ -787,6 +801,7 @@ fn test_public_key_mismatch() {
 
     let contract_id = env.register(UtilityContract, ());
     let client = UtilityContractClient::new(&env, &contract_id);
+    client.initialize(&Address::generate(&env));
 
     let user = Address::generate(&env);
     let provider = Address::generate(&env);
@@ -834,6 +849,7 @@ fn test_update_device_public_key() {
 
     let contract_id = env.register(UtilityContract, ());
     let client = UtilityContractClient::new(&env, &contract_id);
+    client.initialize(&Address::generate(&env));
 
     let user = Address::generate(&env);
     let provider = Address::generate(&env);
@@ -867,6 +883,7 @@ fn test_xlm_to_usd_conversion_top_up() {
 
     let contract_id = env.register(UtilityContract, ());
     let client = UtilityContractClient::new(&env, &contract_id);
+    client.initialize(&Address::generate(&env));
 
     let user = Address::generate(&env);
     let provider = Address::generate(&env);
@@ -900,6 +917,7 @@ fn test_challenge_response_pairing() {
 
     let contract_id = env.register(UtilityContract, ());
     let client = UtilityContractClient::new(&env, &contract_id);
+    client.initialize(&Address::generate(&env));
 
     let user = Address::generate(&env);
     let provider = Address::generate(&env);
@@ -934,6 +952,7 @@ fn test_deduct_units_fails_when_not_paired() {
 
     let contract_id = env.register(UtilityContract, ());
     let client = UtilityContractClient::new(&env, &contract_id);
+    client.initialize(&Address::generate(&env));
 
     let user = Address::generate(&env);
     let provider = Address::generate(&env);
@@ -965,6 +984,7 @@ fn test_withdraw_earnings_xlm_conversion() {
 
     let contract_id = env.register(UtilityContract, ());
     let client = UtilityContractClient::new(&env, &contract_id);
+    client.initialize(&Address::generate(&env));
 
     let user = Address::generate(&env);
     let provider = Address::generate(&env);
@@ -1014,6 +1034,7 @@ fn test_get_current_rate() {
 
     let contract_id = env.register(UtilityContract, ());
     let client = UtilityContractClient::new(&env, &contract_id);
+    client.initialize(&Address::generate(&env));
 
     // No oracle set initially
     assert!(client.get_current_rate().is_none());
