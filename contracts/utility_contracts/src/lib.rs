@@ -140,6 +140,17 @@ pub struct PairingChallengeData {
 #[contract]
 pub struct UtilityContract;
 
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum MeterEvent {
+    Connected(u64),
+    Disconnected(u64),
+    Usage(u64, i128, i128),
+    PairInit(u64, BytesN<32>),
+    TopUp(u64, i128, i128),
+    Withdrawal(u64, i128, i128),
+}
+
 const HOUR_IN_SECONDS: u64 = 60 * 60;
 const DAY_IN_SECONDS: u64 = 24 * HOUR_IN_SECONDS;
 const DAILY_WITHDRAWAL_PERCENT: i128 = 10;
@@ -385,14 +396,12 @@ fn apply_provider_claim(env: &Env, meter: &mut Meter, amount: i128) {
     meter.claimed_this_hour = meter.claimed_this_hour.saturating_add(amount);
 }
 
-fn publish_active_event(env: &Env, meter_id: u64, now: u64) {
-    env.events()
-        .publish((symbol_short!("Active"), meter_id), now);
+fn publish_active_event(env: &Env, meter_id: u64, _now: u64) {
+    env.events().publish((symbol_short!("Meter"),), MeterEvent::Connected(meter_id));
 }
 
-fn publish_inactive_event(env: &Env, meter_id: u64, now: u64) {
-    env.events()
-        .publish((symbol_short!("Inactive"), meter_id), now);
+fn publish_inactive_event(env: &Env, meter_id: u64, _now: u64) {
+    env.events().publish((symbol_short!("Meter"),), MeterEvent::Disconnected(meter_id));
 }
 
 #[contractimpl]
@@ -530,10 +539,10 @@ impl UtilityContract {
         
         env.storage().instance().set(&DataKey::Meter(meter_id), &meter);
         
-        // Emit conversion event
+        // Emit unified top-up event
         env.events().publish(
-            (symbol_short!("TokenUp"), meter_id), 
-            (amount, converted_amount)
+            (symbol_short!("Meter"),),
+            MeterEvent::TopUp(meter_id, amount, converted_amount)
         );
     }
 
@@ -599,7 +608,7 @@ impl UtilityContract {
             .set(&DataKey::PairingChallenge(meter_id), &challenge);
 
         env.events()
-            .publish((symbol_short!("PairInit"), meter_id), challenge.clone());
+            .publish((symbol_short!("Meter"),), MeterEvent::PairInit(meter_id, challenge.clone()));
 
         challenge.into()
     }
@@ -687,7 +696,7 @@ impl UtilityContract {
         }
 
         env.events()
-            .publish((symbol_short!("Usage"), signed_data.meter_id), (signed_data.units_consumed, claimable));
+            .publish((symbol_short!("Meter"),), MeterEvent::Usage(signed_data.meter_id, signed_data.units_consumed, claimable));
     }
 
     pub fn set_max_flow_rate(env: Env, meter_id: u64, max_flow_rate_per_hour: i128) {
@@ -840,13 +849,17 @@ impl UtilityContract {
             meter.last_update = now;
         }
         
+        if was_active && !meter.is_active {
+            publish_inactive_event(&env, meter_id, now);
+        }
+
         env.storage().instance().set(&DataKey::Meter(meter_id), &meter);
         
-        // Emit conversion event if XLM was used
+        // Emit withdrawal event if XLM was used
         if is_native_token(&meter.token) {
             env.events().publish(
-                (symbol_short!("USDtoXLM"), meter_id), 
-                (amount_usd_cents, withdrawal_amount)
+                (symbol_short!("Meter"),),
+                MeterEvent::Withdrawal(meter_id, amount_usd_cents, withdrawal_amount)
             );
         }
     }
