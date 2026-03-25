@@ -124,6 +124,7 @@ pub enum ContractError {
     ChallengeNotFound = 13,
     InvalidPairingSignature = 14,
     MeterNotPaired = 15,
+    DuplicateTimestamp = 16,
     AlreadyInitialized = 100,
     Unauthorized = 101,
 }
@@ -152,7 +153,12 @@ fn verify_usage_signature(env: &Env, signed_data: &SignedUsageData, meter: &Mete
         return Err(ContractError::PublicKeyMismatch);
     }
 
-    // Check timestamp is not too old (prevent replay attacks)
+    // Check timestamp is strictly increasing to prevent replay attacks
+    if signed_data.timestamp <= meter.usage_data.last_reading_timestamp {
+        return Err(ContractError::DuplicateTimestamp);
+    }
+
+    // Check timestamp is not too old (max allowed drift)
     let current_time = env.ledger().timestamp();
     if current_time.saturating_sub(signed_data.timestamp) > MAX_TIMESTAMP_DELAY {
         return Err(ContractError::TimestampTooOld);
@@ -666,6 +672,11 @@ impl UtilityContract {
 
         let was_active = meter.is_active;
         apply_provider_claim(&env, &mut meter, claimable);
+        
+        // Update usage statistics and prevent future replays
+        meter.usage_data.last_reading_timestamp = signed_data.timestamp;
+        meter.usage_data.total_watt_hours = meter.usage_data.total_watt_hours.saturating_add(signed_data.watt_hours_consumed);
+        
         meter.last_update = now;
         refresh_activity(&mut meter);
 
