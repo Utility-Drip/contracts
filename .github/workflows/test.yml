@@ -48,6 +48,14 @@ jobs:
         
       - name: Build Contract
         run: cargo build --target wasm32-unknown-unknown --release
+
+      - name: Install dependencies for optimization
+        run: sudo apt-get update && sudo apt-get install -y binaryen
+
+      - name: Optimize Wasm
+        run: |
+          stellar contract optimize --wasm target/wasm32-unknown-unknown/release/price_oracle.wasm
+          stellar contract optimize --wasm target/wasm32-unknown-unknown/release/utility_contracts.wasm
         
       - name: Run Unit Tests
         run: cargo test
@@ -72,3 +80,4 @@ jobs:
           if [ -d "contracts/utility_contracts/fuzz" ]; then
             echo "- ✅ Fuzz tests: Available and configured" >> $GITHUB_STEP_SUMMARY
           fi
+          echo "- ✅ Wasm Optimization: stellar contract optimize" >> $GITHUB_STEP_SUMMARY
