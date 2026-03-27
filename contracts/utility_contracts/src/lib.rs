@@ -43,6 +43,7 @@ pub struct UsageReport {
     pub timestamp: u64,
     pub watt_hours_consumed: i128,
     pub units_consumed: i128,
+    pub is_renewable_energy: bool,
 }
 
 #[contracttype]
@@ -52,6 +53,7 @@ pub struct SignedUsageData {
     pub timestamp: u64,
     pub watt_hours_consumed: i128,
     pub units_consumed: i128,
+    pub is_renewable_energy: bool,
     pub signature: BytesN<64>,
     pub public_key: BytesN<32>,
 }
@@ -64,6 +66,8 @@ pub struct UsageData {
     pub peak_usage_watt_hours: i128,
     pub last_reading_timestamp: u64,
     pub precision_factor: i128,
+    pub renewable_watt_hours: i128,
+    pub renewable_percentage: i128,
 }
 
 #[contracttype]
@@ -76,6 +80,7 @@ pub struct Meter {
     pub peak_rate: i128,          // rate per second during peak hours (1.5x off-peak)
     pub rate_per_second: i128,
     pub rate_per_unit: i128,
+    pub green_energy_discount_bps: i128,  // discount in basis points for renewable energy
     pub balance: i128,
     pub debt: i128,
     pub collateral_limit: i128,
@@ -161,6 +166,7 @@ const PEAK_HOUR_START: u64 = 18 * HOUR_IN_SECONDS; // 64800 seconds
 const PEAK_HOUR_END: u64 = 21 * HOUR_IN_SECONDS;   // 75600 seconds
 const PEAK_RATE_MULTIPLIER: i128 = 3; // 1.5x => stored as 3 (divide by 2)
 const RATE_PRECISION: i128 = 2; // Precision for rate calculations
+const DEFAULT_GREEN_ENERGY_DISCOUNT_BPS: i128 = 500; // 5% discount for renewable energy (500 basis points)
 
 // XLM precision constants - XLM has 7 decimal places (0.0000001 minimum)
 const XLM_PRECISION: i128 = 10_000_000; // 10^7 for 7 decimal places
@@ -304,11 +310,19 @@ fn is_peak_hour(timestamp: u64) -> bool {
     seconds_in_day >= PEAK_HOUR_START && seconds_in_day < PEAK_HOUR_END
 }
 
-fn get_effective_rate(meter: &Meter, timestamp: u64) -> i128 {
-    if is_peak_hour(timestamp) {
+fn get_effective_rate(meter: &Meter, timestamp: u64, is_renewable_energy: bool) -> i128 {
+    let base_rate = if is_peak_hour(timestamp) {
         meter.peak_rate
     } else {
         meter.off_peak_rate
+    };
+    
+    // Apply green energy discount if applicable
+    if is_renewable_energy {
+        let discount_amount = base_rate.saturating_mul(meter.green_energy_discount_bps) / 10000;
+        base_rate.saturating_sub(discount_amount)
+    } else {
+        base_rate
     }
 }
 
@@ -460,6 +474,19 @@ impl UtilityContract {
         env.storage().instance().set(&DataKey::SupportedWithdrawalToken(token), &false);
     }
 
+    /// Set green energy discount for a specific meter (in basis points)
+    pub fn set_green_energy_discount(env: Env, meter_id: u64, discount_bps: i128) {
+        let mut meter = get_meter_or_panic(&env, meter_id);
+        meter.provider.require_auth();
+        
+        if discount_bps < 0 || discount_bps > 10000 {
+            panic_with_error!(&env, ContractError::InvalidUsageValue);
+        }
+        
+        meter.green_energy_discount_bps = discount_bps;
+        env.storage().instance().set(&DataKey::Meter(meter_id), &meter);
+    }
+
     pub fn register_meter(
         env: Env,
         user: Address,
@@ -506,6 +533,8 @@ impl UtilityContract {
             peak_usage_watt_hours: 0,
             last_reading_timestamp: now,
             precision_factor: 1000,
+            renewable_watt_hours: 0,
+            renewable_percentage: 0,
         };
 
         let meter = Meter {
@@ -516,6 +545,7 @@ impl UtilityContract {
             peak_rate,
             rate_per_second: off_peak_rate,
             rate_per_unit: off_peak_rate,
+            green_energy_discount_bps: DEFAULT_GREEN_ENERGY_DISCOUNT_BPS,
             balance: 0,
             debt: 0,
             collateral_limit: 0,
@@ -675,7 +705,7 @@ impl UtilityContract {
         }
 
         let now = env.ledger().timestamp();
-        let effective_rate = get_effective_rate(&meter, signed_data.timestamp);
+        let effective_rate = get_effective_rate(&meter, signed_data.timestamp, signed_data.is_renewable_energy);
         let cost = signed_data.units_consumed.saturating_mul(effective_rate);
 
         // Apply provider withdrawal limits
@@ -699,6 +729,22 @@ impl UtilityContract {
             .usage_data
             .current_cycle_watt_hours
             .saturating_add(signed_data.watt_hours_consumed);
+
+        // Track renewable energy usage
+        if signed_data.is_renewable_energy {
+            meter.usage_data.renewable_watt_hours = meter
+                .usage_data
+                .renewable_watt_hours
+                .saturating_add(signed_data.watt_hours_consumed);
+        }
+
+        // Update renewable percentage
+        if meter.usage_data.total_watt_hours > 0 {
+            meter.usage_data.renewable_percentage = meter
+                .usage_data
+                .renewable_watt_hours
+                .saturating_mul(10000) / meter.usage_data.total_watt_hours; // in basis points
+        }
 
         if meter.usage_data.current_cycle_watt_hours > meter.usage_data.peak_usage_watt_hours {
             meter.usage_data.peak_usage_watt_hours = meter.usage_data.current_cycle_watt_hours;
@@ -1304,6 +1350,7 @@ fn verify_usage_signature(env: &Env, signed_data: &SignedUsageData, meter: &Mete
         timestamp: signed_data.timestamp,
         watt_hours_consumed: signed_data.watt_hours_consumed,
         units_consumed: signed_data.units_consumed,
+        is_renewable_energy: signed_data.is_renewable_energy,
     };
 
     // Verify the signature using Soroban's built-in signature verification.

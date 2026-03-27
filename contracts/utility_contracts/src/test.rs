@@ -1793,3 +1793,84 @@ fn test_add_remove_withdrawal_tokens() {
     assert!(!client.is_withdrawal_token_supported(&token_address));
 }
 
+#[test]
+fn test_green_energy_bonus() {
+    let env = Env::default();
+    let contract_address = env.register_contract(None, UtilityContract);
+    let client = UtilityContractClient::new(&env, &contract_address);
+    
+    let user = Address::generate(&env);
+    let provider = Address::generate(&env);
+    let token_address = Address::generate(&env);
+    
+    // Register a meter
+    let meter_id = client.register_meter_with_mode(
+        &user,
+        &provider,
+        &1000, // off-peak rate
+        &token_address,
+        &BillingType::PrePaid,
+        &BytesN::from_array(&env, &[0; 32]),
+    );
+    
+    // Set custom green energy discount (10% = 1000 basis points)
+    client.set_green_energy_discount(&meter_id, &1000);
+    
+    // Top up the meter
+    client.top_up(&meter_id, &10000);
+    
+    // Mock usage data - renewable energy
+    let renewable_usage = SignedUsageData {
+        meter_id: meter_id.clone(),
+        timestamp: env.ledger().timestamp(),
+        watt_hours_consumed: 100,
+        units_consumed: 50,
+        is_renewable_energy: true,
+        signature: BytesN::from_array(&env, &[0; 64]),
+        public_key: BytesN::from_array(&env, &[0; 32]),
+    };
+    
+    // Mock usage data - non-renewable energy  
+    let non_renewable_usage = SignedUsageData {
+        meter_id: meter_id.clone(),
+        timestamp: env.ledger().timestamp(),
+        watt_hours_consumed: 100,
+        units_consumed: 50,
+        is_renewable_energy: false,
+        signature: BytesN::from_array(&env, &[0; 64]),
+        public_key: BytesN::from_array(&env, &[0; 32]),
+    };
+    
+    // Pair the meter (skip signature verification for test)
+    env.storage().instance().set(&DataKey::PairingChallenge(meter_id.clone()), &BytesN::from_array(&env, &[0; 32]));
+    let mut meter: Meter = env.storage().instance().get(&DataKey::Meter(meter_id.clone())).unwrap();
+    meter.is_paired = true;
+    env.storage().instance().set(&DataKey::Meter(meter_id.clone()), &meter);
+    
+    let initial_balance = meter.balance;
+    
+    // Test renewable energy usage (should get 10% discount)
+    // Note: In actual test environment, signature verification is skipped
+    client.deduct_units(&renewable_usage);
+    
+    let renewable_meter: Meter = env.storage().instance().get(&DataKey::Meter(meter_id.clone())).unwrap();
+    let renewable_cost = initial_balance - renewable_meter.balance;
+    
+    // Reset balance for comparison
+    renewable_meter.balance = initial_balance;
+    env.storage().instance().set(&DataKey::Meter(meter_id.clone()), &renewable_meter);
+    
+    // Test non-renewable energy usage (full price)
+    client.deduct_units(&non_renewable_usage);
+    
+    let final_meter: Meter = env.storage().instance().get(&DataKey::Meter(meter_id.clone())).unwrap();
+    let non_renewable_cost = initial_balance - final_meter.balance;
+    
+    // Verify renewable energy cost is lower (10% discount applied)
+    assert!(renewable_cost < non_renewable_cost);
+    
+    // Verify renewable energy tracking
+    assert!(final_meter.usage_data.renewable_watt_hours > 0);
+    assert!(final_meter.usage_data.renewable_percentage > 0);
+}
+
