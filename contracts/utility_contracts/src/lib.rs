@@ -92,7 +92,6 @@ pub struct Meter {
     pub device_public_key: BytesN<32>,
     pub is_paired: bool,
 
-}
 
 #[contracttype]
 #[derive(Clone)]
@@ -130,6 +129,7 @@ pub enum DataKey {
     MaintenanceWallet,
     ProtocolFeeBps,
     SupportedToken(Address),
+    SupportedWithdrawalToken(Address),
     ProviderTotalPool(Address),
     ClosingFeeBps,
 }
@@ -312,6 +312,28 @@ fn convert_usd_to_xlm_if_needed(
             let price_data = oracle_client.get_price();
             let xlm_amount = convert_usd_cents_to_xlm_with_rounding(usd_cents, price_data.price);
             Ok(xlm_amount)
+        }
+        None => Ok(usd_cents),
+    }
+}
+
+fn convert_usd_to_token_if_needed(env: &Env, usd_cents: i128, destination_token: &Address) -> Result<i128, ContractError> {
+    // For now, we assume the oracle can provide conversion rates for any token
+    // In a real implementation, you'd need specific price feeds for each token
+    match env.storage().instance().get::<DataKey, Address>(&DataKey::Oracle) {
+        Some(oracle_address) => {
+            let oracle_client = PriceOracleClient::new(env, &oracle_address);
+            let price_data = oracle_client.get_price();
+            
+            // If destination is XLM (native token), use existing conversion
+            if is_native_token(destination_token) {
+                let xlm_amount = convert_usd_cents_to_xlm_with_rounding(usd_cents, price_data.price);
+                Ok(xlm_amount)
+            } else {
+                // For other tokens, assume 1:1 with USD for now
+                // In production, you'd need specific price feeds for each token
+                Ok(usd_cents)
+            }
         }
         None => Ok(usd_cents),
     }
@@ -515,6 +537,16 @@ impl UtilityContract {
         env.storage()
             .instance()
             .set(&DataKey::SupportedToken(token), &false);
+    }
+
+    /// Add a supported withdrawal token for path payments
+    pub fn add_supported_withdrawal_token(env: Env, token: Address) {
+        env.storage().instance().set(&DataKey::SupportedWithdrawalToken(token), &true);
+    }
+
+    /// Remove a supported withdrawal token for path payments
+    pub fn remove_supported_withdrawal_token(env: Env, token: Address) {
+        env.storage().instance().set(&DataKey::SupportedWithdrawalToken(token), &false);
     }
 
     pub fn register_meter(
@@ -1388,6 +1420,117 @@ impl UtilityContract {
                 (final_refund_amount, withdrawal_amount)
             );
         }
+    }
+
+    /// Withdraw earnings with path payment support - allows provider to receive XLM
+    /// even when payments were made in USDC or other tokens
+    pub fn withdraw_earnings_path_payment(env: Env, meter_id: u64, amount_usd_cents: i128, destination_token: Address) {
+        let mut meter = get_meter_or_panic(&env, meter_id);
+        meter.provider.require_auth();
+        
+        if amount_usd_cents <= 0 {
+            panic_with_error!(&env, ContractError::InvalidTokenAmount);
+        }
+        
+        // Check if destination token is supported for withdrawal
+        if !Self::is_withdrawal_token_supported(env.clone(), destination_token.clone()) {
+            panic_with_error!(&env, ContractError::InvalidTokenAmount);
+        }
+        
+        // Store old meter value for pool update
+        let old_meter_value = provider_meter_value(&meter);
+        
+        let available_earnings = match meter.billing_type {
+            BillingType::PrePaid => meter.balance,
+            BillingType::PostPaid => meter.debt,
+        };
+        
+        if amount_usd_cents > available_earnings {
+            panic_with_error!(&env, ContractError::InvalidTokenAmount);
+        }
+        
+        // If destination token is same as meter token, use regular withdrawal
+        if destination_token == meter.token {
+            Self::withdraw_earnings(env.clone(), meter_id, amount_usd_cents);
+            return;
+        }
+        
+        // Convert USD cents to destination token amount
+        let withdrawal_amount = match convert_usd_to_token_if_needed(&env, amount_usd_cents, &destination_token) {
+            Ok(amount) => amount,
+            Err(_) => panic_with_error!(&env, ContractError::PriceConversionFailed),
+        };
+        
+        // For path payment, we need to:
+        // 1. Convert from meter token to USD (if not already USD)
+        // 2. Convert from USD to destination token
+        // This is handled by the oracle conversion functions
+        
+        // Transfer destination tokens to provider
+        let destination_client = token::Client::new(&env, &destination_token);
+        
+        // Check if contract has enough destination tokens
+        let contract_balance = destination_client.balance(&env.current_contract_address());
+        if contract_balance < withdrawal_amount {
+            panic_with_error!(&env, ContractError::InsufficientBalance);
+        }
+        
+        destination_client.transfer(&env.current_contract_address(), &meter.provider, &withdrawal_amount);
+        
+        // Update meter balance/debt (deduct in USD cents)
+        match meter.billing_type {
+            BillingType::PrePaid => {
+                meter.balance = meter.balance.saturating_sub(amount_usd_cents);
+            }
+            BillingType::PostPaid => {
+                meter.debt = meter.debt.saturating_sub(amount_usd_cents);
+            }
+        }
+        
+        let now = env.ledger().timestamp();
+        let was_active = meter.is_active;
+        refresh_activity(&mut meter);
+        
+        if !was_active && meter.is_active {
+            meter.last_update = now;
+        }
+        
+        // Update provider total pool
+        let new_meter_value = provider_meter_value(&meter);
+        update_provider_total_pool(&env, &meter.provider, old_meter_value, new_meter_value);
+        
+        env.storage().instance().set(&DataKey::Meter(meter_id), &meter);
+        
+        // Emit path payment event
+        env.events().publish(
+            (symbol_short!("PathPayment"), meter_id), 
+            (meter.token, destination_token, amount_usd_cents, withdrawal_amount)
+        );
+    }
+
+    /// Get supported withdrawal tokens for a provider
+    pub fn get_supported_withdrawal_tokens(env: Env) -> Vec<Address> {
+        let mut supported_tokens = Vec::new(&env);
+        
+        // Add XLM as native token - represented by the contract's own address for native token
+        // In Stellar, native token operations use the contract address directly
+        supported_tokens.push_back(env.current_contract_address());
+        
+        // In a full implementation, you would iterate through stored supported withdrawal tokens
+        // For now, we return just the native token
+        
+        supported_tokens
+    }
+
+    /// Check if a token is supported for withdrawal
+    pub fn is_withdrawal_token_supported(env: Env, token: Address) -> bool {
+        // Always support native token (XLM)
+        if token == env.current_contract_address() {
+            return true;
+        }
+        
+        // Check if token is in supported withdrawal tokens list
+        env.storage().instance().get::<DataKey, bool>(&DataKey::SupportedWithdrawalToken(token)).unwrap_or(false)
     }
 
     /// Get refund estimate for a meter (does not execute the refund)

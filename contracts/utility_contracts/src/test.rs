@@ -1672,4 +1672,3 @@ fn test_batch_register_meters_empty_vector() {
     let contract_address = env.register_contract(None, UtilityContract);
     let client = UtilityContractClient::new(&env, &contract_address);
 
-
